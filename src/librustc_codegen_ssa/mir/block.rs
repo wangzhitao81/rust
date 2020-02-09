@@ -15,7 +15,7 @@ use rustc::mir::interpret::PanicInfo;
 use rustc::ty::layout::{self, FnAbiExt, HasTyCtxt, LayoutOf};
 use rustc::ty::{self, Instance, Ty, TypeFoldable};
 use rustc_index::vec::Idx;
-use rustc_span::{source_map::Span, symbol::Symbol};
+use rustc_span::{Span, Symbol};
 use rustc_target::abi::call::{ArgAbi, FnAbi, PassMode};
 use rustc_target::spec::abi::Abi;
 
@@ -408,7 +408,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         self.set_debug_loc(&mut bx, terminator.source_info);
 
         // Get the location information.
-        let location = self.get_caller_location(&mut bx, span).immediate();
+        let location = self.get_caller_location(&mut bx, terminator.source_info).immediate();
 
         // Put together the arguments to the panic entry point.
         let (lang_item, args) = match msg {
@@ -444,7 +444,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         destination: &Option<(mir::Place<'tcx>, mir::BasicBlock)>,
         cleanup: Option<mir::BasicBlock>,
     ) {
-        let span = terminator.source_info.span;
+        let source_info = terminator.source_info;
+        let span = source_info.span;
+
         // Create the callee. This is a fn ptr or zero-sized and hence a kind of scalar.
         let callee = self.codegen_operand(&mut bx, func);
 
@@ -530,7 +532,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             if layout.abi.is_uninhabited() {
                 let msg_str = format!("Attempted to instantiate uninhabited type {}", ty);
                 let msg = bx.const_str(Symbol::intern(&msg_str));
-                let location = self.get_caller_location(&mut bx, span).immediate();
+                let location = self.get_caller_location(&mut bx, source_info).immediate();
 
                 // Obtain the panic entry point.
                 let def_id =
@@ -575,7 +577,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
         if intrinsic == Some("caller_location") {
             if let Some((_, target)) = destination.as_ref() {
-                let location = self.get_caller_location(&mut bx, span);
+                let location = self.get_caller_location(&mut bx, source_info);
 
                 if let ReturnDest::IndirectOperand(tmp, _) = ret_dest {
                     location.val.store(&mut bx, tmp);
@@ -627,13 +629,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 })
                 .collect();
 
-            bx.codegen_intrinsic_call(
-                *instance.as_ref().unwrap(),
-                &fn_abi,
-                &args,
-                dest,
-                terminator.source_info.span,
-            );
+            bx.codegen_intrinsic_call(*instance.as_ref().unwrap(), &fn_abi, &args, dest, span);
 
             if let ReturnDest::IndirectOperand(dst, _) = ret_dest {
                 self.store_return(&mut bx, ret_dest, &fn_abi.ret, dst.llval);
@@ -739,7 +735,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 args.len() + 1,
                 "#[track_caller] fn's must have 1 more argument in their ABI than in their MIR",
             );
-            let location = self.get_caller_location(&mut bx, span);
+            let location = self.get_caller_location(&mut bx, source_info);
             let last_arg = fn_abi.args.last().unwrap();
             self.codegen_argument(&mut bx, location, &mut llargs, last_arg);
         }
@@ -982,17 +978,46 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         }
     }
 
-    fn get_caller_location(&mut self, bx: &mut Bx, span: Span) -> OperandRef<'tcx, Bx::Value> {
-        self.caller_location.unwrap_or_else(|| {
+    fn get_caller_location(
+        &mut self,
+        bx: &mut Bx,
+        source_info: mir::SourceInfo,
+    ) -> OperandRef<'tcx, Bx::Value> {
+        let tcx = bx.tcx();
+
+        let mut span_to_caller_location = |span: Span| {
             let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
-            let caller = bx.tcx().sess.source_map().lookup_char_pos(topmost.lo());
-            let const_loc = bx.tcx().const_caller_location((
+            let caller = tcx.sess.source_map().lookup_char_pos(topmost.lo());
+            let const_loc = tcx.const_caller_location((
                 Symbol::intern(&caller.file.name.to_string()),
                 caller.line as u32,
                 caller.col_display as u32 + 1,
             ));
             OperandRef::from_const(bx, const_loc)
-        })
+        };
+
+        // Walk up the `SourceScope`s, in case some of them are from MIR inlining.
+        let mut caller_span = source_info.span;
+        let mut scope = source_info.scope;
+        loop {
+            let scope_data = &self.mir.source_scopes[scope];
+
+            if let Some((callee, callsite_span)) = scope_data.inlined {
+                // Stop before ("inside") the callsite of a non-`#[track_caller]` function.
+                if !callee.def.requires_caller_location(tcx) {
+                    return span_to_caller_location(caller_span);
+                }
+                caller_span = callsite_span;
+            }
+
+            match scope_data.parent_scope {
+                Some(parent) => scope = parent,
+                None => break,
+            }
+        }
+
+        // No inlined `SourceScope`s, or all of them were `#[track_caller]`.
+        self.caller_location.unwrap_or_else(|| span_to_caller_location(caller_span))
     }
 
     fn get_personality_slot(&mut self, bx: &mut Bx) -> PlaceRef<'tcx, Bx::Value> {

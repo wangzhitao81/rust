@@ -224,11 +224,6 @@ impl Inliner<'tcx> {
 
         let codegen_fn_attrs = tcx.codegen_fn_attrs(callsite.callee.def_id());
 
-        if codegen_fn_attrs.flags.contains(CodegenFnAttrFlags::TRACK_CALLER) {
-            debug!("`#[track_caller]` present - not inlining");
-            return false;
-        }
-
         // Avoid inlining functions marked as no_sanitize if sanitizer is enabled,
         // since instrumentation might be enabled and performed on the caller.
         match self.tcx.sess.opts.debugging_opts.sanitizer {
